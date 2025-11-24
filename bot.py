@@ -2,15 +2,15 @@ import asyncio
 import os
 from pyrogram import Client, filters
 from pyrogram.types import Message
-from pytgcalls import PyTgCalls, StreamType
-from pytgcalls.types import AudioPiped
-from pytgcalls.exceptions import AlreadyJoinedError, NoActiveGroupCall
+# WARNING: Using py-tgcalls==0.6.0. This version is deprecated and unstable.
+from pytgcalls import PyTgCalls
+from pytgcalls.types import Update
+from pytgcalls.types.input_stream import InputStream, InputFileType
+from pytgcalls.types.exceptions import GroupCallNotFound, NotInGroupCallError, NoActiveGroupCall
 
 # ====================================================================
 # 1. CONFIGURATION (REPLACE WITH YOUR OWN VALUES)
 # ====================================================================
-
-# Get these from https://my.telegram.org/
 API_ID = 33090746 # <--- REPLACE THIS
 API_HASH = "b8ebbe19e5c5e0fd4f0089ab4553f959" # <--- REPLACE THIS
 SESSION_NAME = ""
@@ -19,18 +19,16 @@ SESSION_NAME = ""
 # 2. GLOBAL STATE AND CLIENT INITIALIZATION
 # ====================================================================
 
-# Initialize Pyrogram Client (Userbot)
 app = Client(SESSION_NAME, API_ID, API_HASH)
 # Initialize PyTgCalls with the Pyrogram client
 voice_client = PyTgCalls(app) 
 
-# State variables
 QUEUE = []
 CURRENT_PLAYING = None
 IS_PAUSED = False
 
 # ====================================================================
-# 3. UTILITY FUNCTION (Track Playback Logic)
+# 3. UTILITY FUNCTION (Track Playback Logic - Adapted for v0.6.0)
 # ====================================================================
 
 async def play_next_track(client: Client):
@@ -38,29 +36,29 @@ async def play_next_track(client: Client):
     global CURRENT_PLAYING
     
     if not QUEUE:
-        print("Queue empty, leaving voice chat.")
         if CURRENT_PLAYING:
             try:
-                await voice_client.leave_group_call(CURRENT_PLAYING["chat_id"])
+                # v0.6.0 uses 'leave_call'
+                await voice_client.leave_call(CURRENT_PLAYING["chat_id"])
             except Exception:
-                pass # Already left or error
+                pass 
         CURRENT_PLAYING = None
         return
 
-    # Pop the next track from the queue (FIFO)
     track = QUEUE.pop(0) 
     chat_id = track["chat_id"]
     file_path = track["file_path"]
     
     try:
-        # Stream the audio. AudioPiped is used for raw audio streams.
-        await voice_client.stream_audio(
-            chat_id, 
-            AudioPiped(file_path),
-            stream_type=StreamType().pulse_stream
+        # v0.6.0 uses InputStream and InputFileType.
+        input_stream = InputStream(
+            file_path,
+            InputFileType.MusicStream # Use MusicStream for general audio files
         )
+        # v0.6.0 uses 'start_stream'
+        await voice_client.start_stream(chat_id, input_stream)
+        
         CURRENT_PLAYING = track
-        # Notify the user or log the start
         await client.send_message(chat_id, f"🎧 Now Playing: `{os.path.basename(file_path)}`")
     except Exception as e:
         print(f"Error playing track: {e}")
@@ -68,19 +66,23 @@ async def play_next_track(client: Client):
         await play_next_track(client) 
 
 # ====================================================================
-# 4. PYTGCALLS EVENT HANDLER
+# 4. PYTGCALLS EVENT HANDLER (Adapted for v0.6.0)
 # ====================================================================
 
-@voice_client.on_stream_end()
-async def stream_end_handler(client, update):
-    """Automatically called when the current track finishes."""
-    await play_next_track(client)
+@voice_client.on_update()
+async def update_handler(client: PyTgCalls, update: Update):
+    """Handles all updates, including stream end."""
+    # Check if the update is a stream end event
+    if update.name == 'on_stream_end' and CURRENT_PLAYING:
+        print(f"Stream ended for chat {update.chat_id}. Playing next...")
+        await play_next_track(app)
+
 
 # ====================================================================
 # 5. PYROGRAM COMMAND HANDLERS
 # ====================================================================
 
-@app.on_message(filters.me & filters.command("play", prefixes="."))
+@app.on_message(filters.me & filters.command("stream", prefixes="."))
 async def stream_audio_command(client: Client, message: Message):
     """Command: .stream - Streams the replied-to audio file."""
     global CURRENT_PLAYING
@@ -91,9 +93,8 @@ async def stream_audio_command(client: Client, message: Message):
 
     m = await message.edit("📥 Downloading and preparing audio...")
     
-    # 1. Download the audio file
     try:
-        # Pyrogram handles the download and temporary storage
+        # Download media is standard Pyrogram v2.x.x method
         file_path = await client.download_media(message.reply_to_message)
     except Exception as e:
         await m.edit(f"❌ Download failed: `{e}`")
@@ -102,26 +103,26 @@ async def stream_audio_command(client: Client, message: Message):
     chat_id = message.chat.id
     new_track = {"chat_id": chat_id, "file_path": file_path}
 
-    # 2. Check if anything is currently playing
     if CURRENT_PLAYING:
-        # Add to queue
         QUEUE.append(new_track)
         await m.edit(f"✅ Added to queue. Position: **{len(QUEUE)}**")
         return
     
-    # 3. Start playing if nothing is playing
     try:
-        # Join the voice chat if not already joined
-        await voice_client.join_group_call(chat_id, StreamType().pulse_stream) 
+        # v0.6.0 uses 'join_call'
+        await voice_client.join_call(chat_id) 
     except NoActiveGroupCall:
         await m.edit("❌ No active voice chat found in this group.")
-        # Clean up the downloaded file
         os.remove(file_path) 
         return
-    except AlreadyJoinedError:
-        pass # Already in VC, proceed to stream
+    except Exception as e:
+        # Catch other errors, like already joined or permission errors
+        if "already joined" not in str(e).lower():
+             await m.edit(f"❌ Error joining VC: {e}")
+             os.remove(file_path)
+             return
 
-    # Start the stream by calling the utility function
+    # Start the stream 
     await play_next_track(client)
     await m.edit("▶️ Streaming started!")
 
@@ -135,7 +136,6 @@ async def show_queue_command(client, message):
     
     text = "🎧 **Current Queue:**\n"
     for i, track in enumerate(QUEUE):
-        # Use only the filename for a clean display
         text += f"**{i+1}.** `{os.path.basename(track['file_path'])}`\n"
         
     await message.edit(text)
@@ -148,9 +148,10 @@ async def skip_track_command(client, message):
         return
         
     await message.edit("⏩ Skipping current track...")
-    # Stop the current stream to trigger the stream_end_handler
     try:
-        await voice_client.end_stream(CURRENT_PLAYING["chat_id"]) 
+        # v0.6.0 uses 'stop_stream'
+        await voice_client.stop_stream(CURRENT_PLAYING["chat_id"]) 
+        # The update handler will call play_next_track()
         await message.edit("✅ Track **skipped**.")
     except Exception as e:
         await message.edit(f"❌ Failed to skip: {e}")
@@ -164,6 +165,7 @@ async def pause_stream_command(client, message):
         await message.edit("Nothing is playing or already paused.")
         return
     
+    # v0.6.0 uses 'pause_stream'
     await voice_client.pause_stream(CURRENT_PLAYING["chat_id"])
     IS_PAUSED = True
     await message.edit("⏸️ Stream **paused**.")
@@ -176,6 +178,7 @@ async def resume_stream_command(client, message):
         await message.edit("Nothing is paused to resume.")
         return
         
+    # v0.6.0 uses 'resume_stream'
     await voice_client.resume_stream(CURRENT_PLAYING["chat_id"])
     IS_PAUSED = False
     await message.edit("▶️ Stream **resumed**.")
@@ -191,13 +194,12 @@ async def stop_stream_command(client, message):
 
     chat_id = CURRENT_PLAYING["chat_id"]
 
-    # 1. Leave VC
     try:
-        await voice_client.leave_group_call(chat_id)
+        # v0.6.0 uses 'leave_call'
+        await voice_client.leave_call(chat_id)
     except Exception:
-        pass # Already left or error
+        pass 
 
-    # 2. Clear state
     QUEUE.clear()
     CURRENT_PLAYING = None
     IS_PAUSED = False
@@ -209,33 +211,27 @@ async def stop_stream_command(client, message):
 # ====================================================================
 
 async def main():
-    """Starts both Pyrogram and PyTgCalls clients."""
+    if API_ID == 1234567 or API_HASH == "0123456789abcdef0123456789abcdef":
+        print("!!! ERROR: Please replace API_ID and API_HASH with your own. !!!")
+        return
+        
     print("Starting client...")
-    
-    # Start Pyrogram client
     await app.start() 
     print("Pyrogram client started. Initializing voice client...")
-    
-    # Start PyTgCalls client (must start after Pyrogram)
+    # v0.6.0 uses 'start'
     await voice_client.start() 
     print("Userbot is fully ready! Use .stream in a group with an active VC.")
     
-    # Keep the client running indefinitely
     await asyncio.Future() 
 
 if __name__ == "__main__":
-    # Ensure API credentials are not the placeholders
-    if API_ID == 1234567 or API_HASH == "0123456789abcdef0123456789abcdef":
-        print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-        print("!!! ERROR: Please replace API_ID and API_HASH with your own. !!!")
-        print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-    else:
-        try:
-            asyncio.run(main())
-        except KeyboardInterrupt:
-            print("\nShutting down userbot.")
-            if app.is_connected:
-                asyncio.run(app.stop())
-            if voice_client.is_connected:
-                asyncio.run(voice_client.stop())
-  
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nShutting down userbot.")
+        # Clean up clients upon exit
+        if app.is_connected:
+            asyncio.run(app.stop())
+        if voice_client.is_connected:
+            asyncio.run(voice_client.stop())
+
